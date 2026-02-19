@@ -1,0 +1,370 @@
+--[[ WARNING: Use at your own risk ]]--
+
+local PRIVATE_MODEL_ID = 120538196837455
+
+-- SERVICES
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+
+-- PLAYER
+local Player = Players.LocalPlayer
+local Character = Player.Character or Player.CharacterAdded:Wait()
+local Humanoid = Character:WaitForChild("Humanoid")
+local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
+local Camera = Workspace.CurrentCamera
+
+-- SPEED
+local WALK_SPEED = 9
+local RUN_SPEED = 28
+
+-- SMOOTH
+local SPEED_TRANSITION_TIME = 0.25
+local MOVE_CONFIRM_DELAY = 0.12
+local ANIM_COOLDOWN = 0.1
+
+-- STATE
+local RunMode = false
+local RageMode = false
+local UsingAbility = false
+local currentAnim
+local lastAnimTime = 0
+local movingSince = 0
+local speedTween
+local rageStartTime = 0
+
+-- SOUNDS
+local SWING_SOUND_ID = 113929291877626
+local HIT_SOUND_ID = 79705535085708
+local MISS_SOUND_ID = 98925876457910
+
+-- DASH
+local SMALL_DASH_SPEED = 15
+local MED_DASH_SPEED = 30
+
+-- RAGE TIMEOUT
+local RAGE_TIMEOUT = 20
+
+-- NOTIFY
+StarterGui:SetCore("SendNotification",{
+	Title = "Eunoia",
+	Text = "Menu de animações carregado",
+	Duration = 6
+})
+
+-- LOAD Animator6D
+if not getgenv().Animator6DLoadedPro then
+	loadstring(game:HttpGet(
+		"https://raw.githubusercontent.com/gObl00x/Stuff/refs/heads/main/Animator6D.lua"
+	))()
+	repeat task.wait() until getgenv().Animator6DLoadedPro
+end
+
+-- LOAD MODEL
+local model = game:GetObjects("rbxassetid://"..PRIVATE_MODEL_ID)[1]
+assert(model,"Falha ao carregar modelo")
+
+-- SCAN ANIMATIONS
+local Animations = {}
+local function scan(o)
+	if o:IsA("KeyframeSequence") then
+		table.insert(Animations,o)
+	end
+	for _,c in ipairs(o:GetChildren()) do
+		scan(c)
+	end
+end
+scan(model)
+
+-- ASSIGN ANIMATIONS BY NAME
+local JasonIdleKF, WalkKF, RunKF, SwingKF, BeheadKF, GashingWoundKF, GashingWoundHitKF
+local RagingPaceStartKF, RagingIdleKF, RageWalkKF, RagingSwingKF, RagingBeheadKF
+local JasonStunnedStartKF, JasonStunnedLoopKF, JasonStunnedEndKF, GuestKillsKF, KillKF, RagingEndKF
+
+for _,a in ipairs(Animations) do
+	local n = a.Name
+	if n == "Jason Idle" then JasonIdleKF = a
+	elseif n == "Walk" then WalkKF = a
+	elseif n == "Run" then RunKF = a
+	elseif n == "Swing" then SwingKF = a
+	elseif n == "Behead" then BeheadKF = a
+	elseif n == "Gashing Wound" then GashingWoundKF = a
+	elseif n == "Gashing Wound Hit" then GashingWoundHitKF = a
+	elseif n == "RagingPaceStart" then RagingPaceStartKF = a
+	elseif n == "RagingIdle" then RagingIdleKF = a
+	elseif n == "RageWalk" then RageWalkKF = a
+	elseif n == "RagingSwing" then RagingSwingKF = a
+	elseif n == "RagingBehead" then RagingBeheadKF = a
+	elseif n == "Jason StunnedStart" then JasonStunnedStartKF = a
+	elseif n == "Jason StunnedLoop" then JasonStunnedLoopKF = a
+	elseif n == "Jason StunnedEnd" then JasonStunnedEndKF = a
+	elseif n == "Guest kills" then GuestKillsKF = a
+	elseif n == "Kill" then KillKF = a
+	elseif n == "RagingEnd" then RagingEndKF = a
+	end
+end
+
+-- GET ANIM LENGTH
+local function GetAnimLength(kf)
+	local maxTime = 0
+	for _, keyframe in ipairs(kf:GetChildren()) do
+		if keyframe:IsA("Keyframe") then
+			maxTime = math.max(maxTime, keyframe.Time)
+		end
+	end
+	return maxTime
+end
+
+-- SMOOTH SPEED
+local function SmoothSpeed(target)
+	if speedTween then speedTween:Cancel() end
+	speedTween = TweenService:Create(
+		Humanoid,
+		TweenInfo.new(SPEED_TRANSITION_TIME,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),
+		{WalkSpeed = target}
+	)
+	speedTween:Play()
+end
+
+local function ApplySpeed()
+	SmoothSpeed(RunMode and RUN_SPEED or WALK_SPEED)
+end
+
+-- PLAY ANIM
+local function Play(kf,looped)
+	if currentAnim == kf then return end
+	if tick()-lastAnimTime < ANIM_COOLDOWN then return end
+	lastAnimTime = tick()
+	getgenv().Animator6DStop()
+	task.wait(0.03)
+	getgenv().Animator6D(kf,1,looped~=false)
+	currentAnim = kf
+end
+
+-- RUN MODE
+local function SetRunMode(v)
+	RunMode = v
+	ApplySpeed()
+end
+
+-- START/END ABILITY (LOCK MOVEMENT)
+local function StartAbility()
+	UsingAbility = true
+	Humanoid.WalkSpeed = 0
+end
+
+local function EndAbility()
+	UsingAbility = false
+	ApplySpeed()
+end
+
+-- PLAY SOUND
+local function PlaySound(id)
+	local sound = Instance.new("Sound")
+	sound.SoundId = "rbxassetid://" .. id
+	sound.Parent = Character:WaitForChild("Head")
+	sound.Volume = 1
+	sound:Play()
+	sound.Ended:Connect(function() sound:Destroy() end)
+end
+
+-- DASH
+local function Dash(speed)
+	local dir = Humanoid.MoveDirection
+	if dir.Magnitude == 0 then
+		dir = Camera.CFrame.LookVector * Vector3.new(1,0,1).Unit
+	end
+	dir = dir.Unit
+	HumanoidRootPart.AssemblyLinearVelocity += dir * speed
+end
+
+-- EXIT RAGE WITH ANIM
+local function ExitRageWithEnd()
+	if not RageMode then return end
+	StartAbility()
+	Play(RagingEndKF, false)
+	task.wait(GetAnimLength(RagingEndKF))
+	RageMode = false
+	EndAbility()
+end
+
+-- SHIFT TOGGLE
+UserInputService.InputBegan:Connect(function(i,gp)
+	if gp then return end
+	if i.KeyCode==Enum.KeyCode.LeftShift or i.KeyCode==Enum.KeyCode.RightShift then
+		SetRunMode(not RunMode)
+	end
+end)
+
+-- OTHER INPUTS
+UserInputService.InputBegan:Connect(function(i,gp)
+	if gp then return end
+	local key = i.KeyCode
+	local inputType = i.UserInputType
+	
+	if inputType == Enum.UserInputType.MouseButton1 or key == Enum.KeyCode.T then
+		if UsingAbility then return end
+		task.spawn(function()
+			StartAbility()
+			if RageMode then
+				Play(RagingSwingKF, false)
+				Dash(MED_DASH_SPEED)
+				PlaySound(SWING_SOUND_ID) -- Assuming same sound for rage swing
+				task.wait(GetAnimLength(RagingSwingKF))
+				RageMode = false
+			else
+				Play(SwingKF, false)
+				PlaySound(SWING_SOUND_ID)
+				task.wait(GetAnimLength(SwingKF))
+			end
+			EndAbility()
+		end)
+	elseif key == Enum.KeyCode.Q then
+		if UsingAbility then return end
+		task.spawn(function()
+			StartAbility()
+			if RageMode then
+				Play(RagingBeheadKF, false)
+				Dash(MED_DASH_SPEED)
+				task.wait(GetAnimLength(RagingBeheadKF))
+				RageMode = false
+			else
+				Play(BeheadKF, false)
+				Dash(SMALL_DASH_SPEED)
+				task.wait(GetAnimLength(BeheadKF))
+			end
+			EndAbility()
+		end)
+	elseif key == Enum.KeyCode.E then
+		if UsingAbility then return end
+		task.spawn(function()
+			StartAbility()
+			-- Check for hit
+			local dir = Humanoid.MoveDirection
+			if dir.Magnitude == 0 then
+				dir = Camera.CFrame.LookVector
+			end
+			dir = dir.Unit * 10 -- Distance
+			local rayParams = RaycastParams.new()
+			rayParams.FilterType = Enum.RaycastFilterType.Exclude
+			rayParams.FilterDescendantsInstances = {Character}
+			local result = Workspace:Raycast(HumanoidRootPart.Position, dir, rayParams)
+			local hitHumanoid = false
+			if result and result.Instance then
+				local hitModel = result.Instance:FindFirstAncestorWhichIsA("Model")
+				if hitModel and hitModel:FindFirstChild("Humanoid") then
+					hitHumanoid = true
+				end
+			end
+			local kf = hitHumanoid and GashingWoundHitKF or GashingWoundKF
+			local soundId = hitHumanoid and HIT_SOUND_ID or MISS_SOUND_ID
+			Play(kf, false)
+			PlaySound(soundId)
+			task.wait(GetAnimLength(kf))
+			if RageMode then
+				RageMode = false
+			end
+			EndAbility()
+		end)
+	elseif key == Enum.KeyCode.R then
+		if UsingAbility or RageMode then return end
+		task.spawn(function()
+			StartAbility()
+			Play(RagingPaceStartKF, false)
+			task.wait(GetAnimLength(RagingPaceStartKF))
+			RageMode = true
+			rageStartTime = tick()
+			EndAbility()
+			-- Start timeout
+			task.spawn(function()
+				task.wait(RAGE_TIMEOUT)
+				if RageMode then
+					ExitRageWithEnd()
+				end
+			end)
+		end)
+	elseif key == Enum.KeyCode.One then
+		if UsingAbility then return end
+		task.spawn(function()
+			StartAbility()
+			Play(JasonStunnedStartKF, false)
+			task.wait(GetAnimLength(JasonStunnedStartKF))
+			Play(JasonStunnedLoopKF, true)
+			task.wait(4)
+			getgenv().Animator6DStop()
+			task.wait(0.03)
+			Play(JasonStunnedEndKF, false)
+			task.wait(GetAnimLength(JasonStunnedEndKF))
+			EndAbility()
+		end)
+	elseif key == Enum.KeyCode.Z then
+		if UsingAbility then return end
+		task.spawn(function()
+			StartAbility()
+			Play(GuestKillsKF, false)
+			task.wait(GetAnimLength(GuestKillsKF))
+			EndAbility()
+		end)
+	elseif key == Enum.KeyCode.X then
+		if UsingAbility then return end
+		task.spawn(function()
+			StartAbility()
+			Play(KillKF, false)
+			task.wait(GetAnimLength(KillKF))
+			EndAbility()
+		end)
+	end
+end)
+
+-- INITIAL SPEED
+Humanoid.WalkSpeed = WALK_SPEED
+
+------------------------------------------------
+-- 🟦 MOVEMENT SYSTEM
+------------------------------------------------
+RunService.RenderStepped:Connect(function()
+	if UsingAbility then
+		return
+	end
+
+	local moving = Humanoid.MoveDirection.Magnitude > 0
+
+	if moving then
+		if movingSince == 0 then movingSince = tick() end
+		if tick() - movingSince >= MOVE_CONFIRM_DELAY then
+			if RageMode then
+				Play(RageWalkKF, true)
+			elseif RunMode and RunKF then
+				Play(RunKF, true)
+			else
+				Play(WalkKF, true)
+			end
+		end
+	else
+		movingSince = 0
+		if RageMode then
+			Play(RagingIdleKF, true)
+		else
+			Play(JasonIdleKF, true)
+		end
+	end
+end)
+
+-- RESPAWN
+Player.CharacterAdded:Connect(function(c)
+	Character = c
+	Humanoid = c:WaitForChild("Humanoid")
+	HumanoidRootPart = c:WaitForChild("HumanoidRootPart")
+	Humanoid.WalkSpeed = WALK_SPEED
+end)
+
+local StarterGui = game:GetService("StarterGui")
+
+StarterGui:SetCore("SendNotification", {
+	Title = "animation 6d not mine",
+	Text = "made by mr eyes",
+	Duration = 4
+})
